@@ -1,10 +1,71 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
+import (
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"io/ioutil"
+	"log"
+	"net/rpc"
+	"os"
+	"sort"
+)
 
+// for sorting by key.
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
+
+// create a tmp file for mapres
+// 临时文件防止多个map任务同时写入同一个文件
+func createMapTmpFile(mapid int, reduceid int) string {
+	// 建立临时文件mr-workid-mapid-reduceid
+	filename := fmt.Sprintf("mr-%d-%d-%d", os.Getpid(), mapid, reduceid)
+	os.Remove(filename)
+	f, err := os.Create(filename)
+	if err != nil {
+		log.Fatal("create file error:", err)
+	}
+	f.Close()
+	return filename
+}
+
+// create a res file for map
+func createMapResFile(mapid int, workid int, reduceid int) error {
+	// 将文件名改为m-taskid
+	oldname := fmt.Sprintf("mr-%d-%d-%d", workid, mapid, reduceid)
+	filename := fmt.Sprintf("mr-%d-%d", mapid, reduceid)
+	os.Remove(filename)
+	os.Rename(oldname, filename)
+	log.Fatalf("map task %d done", mapid)
+	return nil
+}
+
+// create a tmp file for reduce
+func createReduceTmpFile(taskid int) string {
+	filename := fmt.Sprintf("r-%d-%d", os.Getpid(), taskid)
+	os.Remove(filename)
+	f, err := os.Create(filename)
+	if err != nil {
+		log.Fatal("create file error:", err)
+	}
+	f.Close()
+	return filename
+}
+
+// create a res file for reduce
+func createReduceResFile(taskid int, workid int) error {
+	// 将文件名改为mr-out-taskid
+	oldname := fmt.Sprintf("r-%d-%d", workid, taskid)
+	filename := fmt.Sprintf("mr-out-%d", taskid)
+	os.Remove(filename)
+	os.Rename(oldname, filename)
+	log.Fatalf("reduce task %d done", taskid)
+	return nil
+}
 
 //
 // Map functions return a slice of KeyValue.
@@ -17,13 +78,12 @@ type KeyValue struct {
 //
 // use ihash(key) % NReduce to choose the reduce
 // task number for each KeyValue emitted by Map.
-//
+// 将相同的key分配到同一个reduce任务中
 func ihash(key string) int {
 	h := fnv.New32a()
 	h.Write([]byte(key))
 	return int(h.Sum32() & 0x7fffffff)
 }
-
 
 //
 // main/mrworker.go calls this function.
@@ -31,39 +91,131 @@ func ihash(key string) int {
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
-	// Your worker implementation here.
+	// 使用进程号作为worker的ID
+	workerId := os.Getpid()
+	// 向coordinator请求
+	// 初次请求时,lasttask为-1
+	args := TaskArgs{
+		WorkerId: workerId,
+		LastTask: -1,
+	}
+	reply := TaskReply{}
 
-	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
+	for {
+		// 向coordinator请求任务
+		ok := call("Coordinator.GetTask", &args, &reply)
+		if !ok {
 
+			log.Fatalf("Coordinator.GetTask error,workerId:%d", workerId)
+		}
+		// 如果完成了所有任务,退出
+		if reply.Tasktype == "finish" {
+			log.Fatalf("workerId:%d finish", workerId)
+			break
+		}
+		if reply.Tasktype == "wait" {
+			// 没有任务，等待
+			log.Fatalf("worker %d is waiting", workerId)
+			continue
+		}
+		if reply.Tasktype == "map" {
+			// map任务
+			mapTask(reply.Taskid, reply.Filename, reply.Nreduce, mapf)
+		} else if reply.Tasktype == "reduce" {
+			// reduce任务
+			reduceTask(reply.Taskid, reply.Filename, reducef)
+		} else {
+			log.Fatalf("unknown task type:%s from worker: %d", reply.Tasktype, workerId)
+		}
+		// 更新args
+		args.LastTask = reply.Taskid
+	}
 }
 
-//
-// example function to show how to make an RPC call to the coordinator.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func CallExample() {
+// mapTask
+func mapTask(taskid int, filename string, nReduce int, mapf func(string, string) []KeyValue) {
 
-	// declare an argument structure.
-	args := ExampleArgs{}
+	file, err := os.Open(filename)
+	if err != nil {
+		log.Fatalf("cannot open %v", filename)
+	}
+	content, err := ioutil.ReadAll(file)
+	if err != nil {
+		log.Fatalf("cannot read %v", filename)
+	}
+	file.Close()
+	kva := mapf(filename, string(content))
+	// 根据key分配到同一个reduce任务中
+	hashmap := make(map[int][]KeyValue)
+	for _, kv := range kva {
+		hash := ihash(kv.Key)
+		hashmap[hash] = append(hashmap[hash], kv)
+	}
+	// 写入临时文件
+	for i := 0; i < nReduce; i++ {
+		tmpFile := createMapTmpFile(taskid, i)
+		tmp, err := os.Open(tmpFile)
+		defer tmp.Close()
+		if err != nil {
+			log.Fatalf("cannot open %v", tmpFile)
+		}
+		enc := json.NewEncoder(tmp)
+		// 将hashmap中的keyvalue写入对应临时文件
+		kva := hashmap[i]
+		for _, kv := range kva {
+			err := enc.Encode(&kv)
+			if err != nil {
+				log.Fatalf("cannot encode %v", kv)
+			}
 
-	// fill in the argument(s).
-	args.X = 99
+		}
+	}
+}
 
-	// declare a reply structure.
-	reply := ExampleReply{}
+// reduceTask
+func reduceTask(taskid int, filename string, reducef func(string, []string) string) {
+	kva := []KeyValue{}
+	file, err := os.Open(filename)
+	defer file.Close()
+	if err != nil {
+		log.Fatalf("cannot open %v", filename)
+	}
+	// 读取文件
+	dec := json.NewDecoder(file)
+	for {
+		var kv KeyValue
+		err := dec.Decode(&kv)
+		if err != nil {
+			break
+		}
+		kva = append(kva, kv)
+	}
+	// 排序
+	sort.Sort(ByKey(kva))
+	// 写入临时文件
+	tmpFile := createReduceTmpFile(taskid)
+	tmp, err := os.Open(tmpFile)
+	defer tmp.Close()
+	if err != nil {
+		log.Fatalf("cannot open %v", tmpFile)
+	}
+	// 从mrsequential.go中获取
+	i := 0
+	for i < len(kva) {
+		j := i + 1
+		for j < len(kva) && kva[j].Key == kva[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, kva[k].Value)
+		}
+		output := reducef(kva[i].Key, values)
 
-	// send the RPC request, wait for the reply.
-	// the "Coordinator.Example" tells the
-	// receiving server that we'd like to call
-	// the Example() method of struct Coordinator.
-	ok := call("Coordinator.Example", &args, &reply)
-	if ok {
-		// reply.Y should be 100.
-		fmt.Printf("reply.Y %v\n", reply.Y)
-	} else {
-		fmt.Printf("call failed!\n")
+		// this is the correct format for each line of Reduce output.
+		fmt.Fprintf(tmp, "%v %v\n", kva[i].Key, output)
+
+		i = j
 	}
 }
 
