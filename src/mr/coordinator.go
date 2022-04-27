@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"net/rpc"
 	"os"
-	"strconv"
 	"sync"
 	"time"
 )
@@ -61,6 +60,10 @@ func (c *Coordinator) GetTask(args *TaskArgs, reply *TaskReply) error {
 	// nTask为0,表示该阶段已经完成
 	if c.nTask == 0 {
 		// 当前stage 是reduce,但是没有任务了,则stage 是done
+		if c.Stage == "done" {
+			reply.Tasktype = "finish"
+			return nil
+		}
 		if c.Stage == "reduce" {
 			c.Stage = "done"
 			c.done = true
@@ -68,6 +71,7 @@ func (c *Coordinator) GetTask(args *TaskArgs, reply *TaskReply) error {
 			reply.Tasktype = "finish"
 			log.Println("-----Finish-----")
 			close(c.TaskPool)
+			// worker 发送请求的时候，master 已经退出了
 			return nil
 		}
 		// map阶段已经完成
@@ -104,7 +108,6 @@ func (c *Coordinator) GetTask(args *TaskArgs, reply *TaskReply) error {
 							task.Time = time.Now()
 							c.reduceFiles[i] = task
 							c.TaskPool <- task
-							c.nTask++
 						}
 					}
 					c.mu.Unlock()
@@ -115,17 +118,11 @@ func (c *Coordinator) GetTask(args *TaskArgs, reply *TaskReply) error {
 			//返回一个wait 任务
 			reply.Taskid = -1
 			reply.Tasktype = "wait"
-			if reply.Tasktype != "wait" {
-				log.Printf("send taskid %d , type %s ", reply.Taskid, reply.Tasktype)
-			}
-
 			return nil
 		}
 
 	}
-	//if reply.Tasktype != "wait" {
-	//log.Printf("send taskid %d , type %s  pool %d task %d", reply.Taskid, reply.Tasktype, len(c.TaskPool), c.nTask)
-	//}
+	//log.Printf("send task %d pool %d nTask %d", reply.Taskid, len(c.TaskPool), c.nTask)
 	return nil
 }
 
@@ -144,21 +141,16 @@ func (c *Coordinator) MapDone(args *TaskArgs, reply *TaskReply) error {
 				break
 			}
 		}
-		log.Printf("map task %d commits : %d ", lasttask, i)
 		// 如果所有提交， 任务数减一
 		if i == c.nReduceFiles {
 			// 确认提交
 			c.mapFiles[lasttask].Status = "finish"
 			c.mapFiles[lasttask].Time = time.Now()
 			c.nTask--
-			//	log.Printf("map task %d in worker %d is finished\n", lasttask, workerId)
-
 		}
 	}
 	// 如果pool为空，但nTask不为0,则表示有任务没有被处理,返回一个wait task
-	//log.Printf("map taskpool len %d,num task %d ", len(c.TaskPool), c.nTask)
 	if c.nTask > 0 && len(c.TaskPool) == 0 {
-		//log.Println("taskpool is empty, but nTask is not 0")
 		reply.Tasktype = "wait"
 		reply.Taskid = -1
 		return nil
@@ -199,21 +191,19 @@ func (c *Coordinator) ReduceDone(args *TaskArgs, reply *TaskReply) error {
 			// 确认提交
 			c.reduceFiles[lasttask].Status = "finish"
 			c.reduceFiles[lasttask].Time = time.Now()
+
 			// 任务数减一
 			c.nTask--
-			//	log.Printf("reduce task %d in worker %d is finished, nTask : %d \n", lasttask, workerId, c.nTask)
 		}
 	}
 
 	if c.nTask > 0 && len(c.TaskPool) == 0 {
-		//log.Println("taskpool is empty, but nTask is not 0")
 		reply.Tasktype = "wait"
 		reply.Taskid = -1
 		return nil
 	}
 	// 如果reduceTask完成，则返回一个wait 任务
 	if c.nTask == 0 {
-		//log.Println("taskpool is empty, but nTask is not 0")
 		return nil
 	}
 
@@ -230,9 +220,6 @@ func (c *Coordinator) ReduceDone(args *TaskArgs, reply *TaskReply) error {
 	reply.Filename = task.FileName
 	reply.Nmap = c.nMapFiles
 	reply.Nreduce = c.nReduceFiles
-	//if reply.Tasktype != "wait" {
-	//	log.Printf("send taskid %d , type %s to worker %d", reply.Taskid, reply.Tasktype, workerId)
-	//}
 	return nil
 }
 
@@ -282,7 +269,6 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	//map stage
 	log.Printf("map stage start")
 	//创建一个task pool 使用缓冲为len(files) 的channel
-	//log.Printf("task pool create")
 	for i, file := range files {
 		// 放入mapFiles 和 TaskPool
 		task := Task{TaskType: "map", TaskId: i, FileName: file, Time: time.Now(), Status: "waiting"}
@@ -293,18 +279,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	log.Printf("tasks load finish: %d", c.nTask)
 	//一个goroutine 执行检查是否超时
 	go func() {
-		// 写入log文件
-		if _, err := os.Create("log.txt"); err != nil {
-			log.Println("create log.txt error:", err)
-		}
-		logFile, err := os.OpenFile("log.txt", os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
-		defer logFile.Close()
-		if err != nil {
-			log.Fatalln("open file error:", err)
-		}
-
 		for {
-
 			c.mu.Lock()
 			// 如果任务完成，则退出
 			if c.Stage == "reduce" {
@@ -316,25 +291,18 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 			// 返回的是
 			for i, task := range c.mapFiles {
 				if task.Status == "waiting" || task.Status == "finish" {
-					// 写入log文件
-					str := task.Time.String() + "reduce task " + strconv.Itoa(i) + " is " + task.Status + "\n"
-					logFile.WriteString(str)
-
 					continue
 				}
 				// 如果超时,则设置为waiting
 				if time.Now().Sub(task.Time) > time.Second*10 {
-					log.Printf("map task %d in work %d timeout\n", task.TaskId, task.WorkerId)
+					log.Printf("map task %d in work %d timeout nTask %d\n", task.TaskId, task.WorkerId, c.nTask)
 					// 更改mapFiles
 					task.Status = "waiting"
 					task.Time = time.Now()
 					c.mapFiles[i] = task
 					c.TaskPool <- task
-					c.nTask++
-					// 写入log文件
-					str := task.Time.String() + "reduce task " + strconv.Itoa(i) + " is " + task.Status + "\n"
-					logFile.WriteString(str)
-
+					// 存在一个任务也没有完成，而且超时。说明没有提交
+					//c.nTask++
 				}
 
 			}

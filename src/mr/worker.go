@@ -119,29 +119,23 @@ func Worker(mapf func(string, string) []KeyValue,
 	reply := TaskReply{}
 
 	for {
-		//log.Printf("lasttask:%d", args.LastTask)
 		// 向coordinator请求任务
 		ok := call("Coordinator.GetTask", &args, &reply)
 		if !ok {
 
 			log.Printf("Coordinator.GetTask error,workerId:%d", workerId)
 		}
-		//if reply.Tasktype != "wait" {
-		//log.Printf("taskId:%d,taskType:%s in worker %d", reply.Taskid, reply.Tasktype, workerId)
-		//}
 		// 打个补丁 不知道为啥 会漏掉一个task
 		if reply.Taskid == -1 && reply.Tasktype != "wait" {
 			reply.Taskid = 0
 		}
-		//time.Sleep(time.Second)
 		// 如果完成了所有任务,退出
 		if reply.Tasktype == "finish" {
 			log.Printf("workerId:%d finish", workerId)
-			break
+			return
 		}
 		if reply.Tasktype == "wait" {
 			// 没有任务，等待
-			//log.Printf("worker %d is waiting", workerId)
 			time.Sleep(time.Second)
 			// 更新args
 			args.LastTask = reply.Taskid
@@ -154,6 +148,7 @@ func Worker(mapf func(string, string) []KeyValue,
 			// reduce任务
 			reduceTask(reply.Taskid, reply.Filename, reply.Nmap, reducef)
 		} else {
+
 			log.Printf("unknown task type:%s from worker: %d", reply.Tasktype, workerId)
 		}
 		// 更新args
@@ -202,7 +197,6 @@ func mapTask(taskid int, filename string, nReduce int, mapf func(string, string)
 
 		}
 	}
-	//log.Printf("map task %d finish", taskid)
 }
 
 // reduceTask
@@ -232,8 +226,9 @@ func reduceTask(taskid int, filename string, nMap int, reducef func(string, []st
 			}
 			kva = append(kva, kv)
 		}
-		// 删除临时文件
-		os.Remove(file)
+		// 删除临时文件 可能在后面读取reducef 有问题
+		//os.Remove(file)
+
 	}
 
 	// 排序
@@ -245,7 +240,6 @@ func reduceTask(taskid int, filename string, nMap int, reducef func(string, []st
 	if err != nil {
 		log.Printf("cannot open %v", tmpFile)
 	}
-	//log.Printf("reduce task %d log", taskid)
 	// 从mrsequential.go中获取
 	i := 0
 	for i < len(kva) {
@@ -264,7 +258,6 @@ func reduceTask(taskid int, filename string, nMap int, reducef func(string, []st
 
 		i = j
 	}
-	//log.Printf("reduce task %d finish", taskid)
 }
 
 //
