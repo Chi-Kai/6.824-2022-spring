@@ -9,6 +9,7 @@ import (
 	"net/rpc"
 	"os"
 	"sort"
+	"time"
 )
 
 // for sorting by key.
@@ -27,7 +28,7 @@ func createMapTmpFile(mapid int, reduceid int) string {
 	os.Remove(filename)
 	f, err := os.Create(filename)
 	if err != nil {
-		log.Fatal("create file error:", err)
+		log.Printf("create file error %s:", err)
 	}
 	f.Close()
 	return filename
@@ -37,10 +38,14 @@ func createMapTmpFile(mapid int, reduceid int) string {
 func createMapResFile(mapid int, workid int, reduceid int) error {
 	// 将文件名改为m-taskid
 	oldname := fmt.Sprintf("mr-%d-%d-%d", workid, mapid, reduceid)
+	// 文件是否存在
+	if _, err := os.Stat(oldname); err != nil {
+		// 不存在
+		return fmt.Errorf("file %s not exist", oldname)
+	}
 	filename := fmt.Sprintf("mr-%d-%d", mapid, reduceid)
 	os.Remove(filename)
 	os.Rename(oldname, filename)
-	log.Fatalf("map task %d done", mapid)
 	return nil
 }
 
@@ -60,11 +65,23 @@ func createReduceTmpFile(taskid int) string {
 func createReduceResFile(taskid int, workid int) error {
 	// 将文件名改为mr-out-taskid
 	oldname := fmt.Sprintf("r-%d-%d", workid, taskid)
+	if _, err := os.Stat(oldname); err != nil {
+		// 不存在
+		return fmt.Errorf("file %s not exist", oldname)
+	}
 	filename := fmt.Sprintf("mr-out-%d", taskid)
 	os.Remove(filename)
 	os.Rename(oldname, filename)
-	log.Fatalf("reduce task %d done", taskid)
 	return nil
+}
+
+// getMapTmpFiles
+func getMapTmpFiles(taskid int, nMap int) []string {
+	var files []string
+	for i := 0; i < nMap; i++ {
+		files = append(files, fmt.Sprintf("mr-%d-%d", i, taskid))
+	}
+	return files
 }
 
 //
@@ -102,20 +119,32 @@ func Worker(mapf func(string, string) []KeyValue,
 	reply := TaskReply{}
 
 	for {
+		//log.Printf("lasttask:%d", args.LastTask)
 		// 向coordinator请求任务
 		ok := call("Coordinator.GetTask", &args, &reply)
 		if !ok {
 
-			log.Fatalf("Coordinator.GetTask error,workerId:%d", workerId)
+			log.Printf("Coordinator.GetTask error,workerId:%d", workerId)
 		}
+		//if reply.Tasktype != "wait" {
+		log.Printf("taskId:%d,taskType:%s in worker %d", reply.Taskid, reply.Tasktype, workerId)
+		//}
+		// 打个补丁 不知道为啥 会漏掉一个task
+		if reply.Taskid == -1 && reply.Tasktype != "wait" {
+			reply.Taskid = 0
+		}
+		//time.Sleep(time.Second)
 		// 如果完成了所有任务,退出
 		if reply.Tasktype == "finish" {
-			log.Fatalf("workerId:%d finish", workerId)
+			log.Printf("workerId:%d finish", workerId)
 			break
 		}
 		if reply.Tasktype == "wait" {
 			// 没有任务，等待
-			log.Fatalf("worker %d is waiting", workerId)
+			//log.Printf("worker %d is waiting", workerId)
+			time.Sleep(time.Second)
+			// 更新args
+			args.LastTask = reply.Taskid
 			continue
 		}
 		if reply.Tasktype == "map" {
@@ -123,9 +152,9 @@ func Worker(mapf func(string, string) []KeyValue,
 			mapTask(reply.Taskid, reply.Filename, reply.Nreduce, mapf)
 		} else if reply.Tasktype == "reduce" {
 			// reduce任务
-			reduceTask(reply.Taskid, reply.Filename, reducef)
+			reduceTask(reply.Taskid, reply.Filename, reply.Nmap, reducef)
 		} else {
-			log.Fatalf("unknown task type:%s from worker: %d", reply.Tasktype, workerId)
+			log.Printf("unknown task type:%s from worker: %d", reply.Tasktype, workerId)
 		}
 		// 更新args
 		args.LastTask = reply.Taskid
@@ -137,11 +166,11 @@ func mapTask(taskid int, filename string, nReduce int, mapf func(string, string)
 
 	file, err := os.Open(filename)
 	if err != nil {
-		log.Fatalf("cannot open %v", filename)
+		log.Printf("cannot open %v", filename)
 	}
 	content, err := ioutil.ReadAll(file)
 	if err != nil {
-		log.Fatalf("cannot read %v", filename)
+		log.Printf("cannot read %v", filename)
 	}
 	file.Close()
 	kva := mapf(filename, string(content))
@@ -149,15 +178,18 @@ func mapTask(taskid int, filename string, nReduce int, mapf func(string, string)
 	hashmap := make(map[int][]KeyValue)
 	for _, kv := range kva {
 		hash := ihash(kv.Key)
+		// 将hash 限定到0~nReduce-1
+		hash = hash % nReduce
 		hashmap[hash] = append(hashmap[hash], kv)
 	}
 	// 写入临时文件
 	for i := 0; i < nReduce; i++ {
 		tmpFile := createMapTmpFile(taskid, i)
-		tmp, err := os.Open(tmpFile)
+		// 打开文件读写,不然会写入失败
+		tmp, err := os.OpenFile(tmpFile, os.O_APPEND|os.O_WRONLY, 0644)
 		defer tmp.Close()
 		if err != nil {
-			log.Fatalf("cannot open %v", tmpFile)
+			log.Printf("cannot open %v", tmpFile)
 		}
 		enc := json.NewEncoder(tmp)
 		// 将hashmap中的keyvalue写入对应临时文件
@@ -165,40 +197,55 @@ func mapTask(taskid int, filename string, nReduce int, mapf func(string, string)
 		for _, kv := range kva {
 			err := enc.Encode(&kv)
 			if err != nil {
-				log.Fatalf("cannot encode %v", kv)
+				log.Printf("cannot encode %v,err %v", kv, err)
 			}
 
 		}
 	}
+	//log.Printf("map task %d finish", taskid)
 }
 
 // reduceTask
-func reduceTask(taskid int, filename string, reducef func(string, []string) string) {
+func reduceTask(taskid int, filename string, nMap int, reducef func(string, []string) string) {
+	if taskid < 0 {
+		log.Printf("taskid:%d is invalid", taskid)
+		return
+	}
+	// 读入相同taskid的所有临时文件
+	files := getMapTmpFiles(taskid, nMap)
+
+	// 创建一个空的map
 	kva := []KeyValue{}
-	file, err := os.Open(filename)
-	defer file.Close()
-	if err != nil {
-		log.Fatalf("cannot open %v", filename)
-	}
-	// 读取文件
-	dec := json.NewDecoder(file)
-	for {
-		var kv KeyValue
-		err := dec.Decode(&kv)
+	for _, file := range files {
+		// 读取临时文件
+		tmp, err := os.Open(file)
+		defer tmp.Close()
 		if err != nil {
-			break
+			log.Printf("cannot open %v", file)
 		}
-		kva = append(kva, kv)
+		dec := json.NewDecoder(tmp)
+		for {
+			var kv KeyValue
+			err := dec.Decode(&kv)
+			if err != nil {
+				break
+			}
+			kva = append(kva, kv)
+		}
+		// 删除临时文件
+		os.Remove(file)
 	}
+
 	// 排序
 	sort.Sort(ByKey(kva))
 	// 写入临时文件
 	tmpFile := createReduceTmpFile(taskid)
-	tmp, err := os.Open(tmpFile)
+	tmp, err := os.OpenFile(tmpFile, os.O_APPEND|os.O_WRONLY, 0644)
 	defer tmp.Close()
 	if err != nil {
-		log.Fatalf("cannot open %v", tmpFile)
+		log.Printf("cannot open %v", tmpFile)
 	}
+	//log.Printf("reduce task %d log", taskid)
 	// 从mrsequential.go中获取
 	i := 0
 	for i < len(kva) {
@@ -217,6 +264,7 @@ func reduceTask(taskid int, filename string, reducef func(string, []string) stri
 
 		i = j
 	}
+	//log.Printf("reduce task %d finish", taskid)
 }
 
 //
