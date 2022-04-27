@@ -124,7 +124,7 @@ func (c *Coordinator) GetTask(args *TaskArgs, reply *TaskReply) error {
 
 	}
 	//if reply.Tasktype != "wait" {
-	log.Printf("send taskid %d , type %s  pool %d task %d", reply.Taskid, reply.Tasktype, len(c.TaskPool), c.nTask)
+	//log.Printf("send taskid %d , type %s  pool %d task %d", reply.Taskid, reply.Tasktype, len(c.TaskPool), c.nTask)
 	//}
 	return nil
 }
@@ -135,9 +135,6 @@ func (c *Coordinator) MapDone(args *TaskArgs, reply *TaskReply) error {
 	lasttask := args.LastTask
 	// 如果有要提交的任务,则提交
 	if lasttask != -1 {
-		c.mapFiles[lasttask].Status = "finish"
-		c.mapFiles[lasttask].Time = time.Now()
-		// 确认提交
 		// 由这个worker 完成的一系列文件
 		i := 0
 		for ; i < c.nReduceFiles; i++ {
@@ -150,6 +147,9 @@ func (c *Coordinator) MapDone(args *TaskArgs, reply *TaskReply) error {
 		log.Printf("map task %d commits : %d ", lasttask, i)
 		// 如果所有提交， 任务数减一
 		if i == c.nReduceFiles {
+			// 确认提交
+			c.mapFiles[lasttask].Status = "finish"
+			c.mapFiles[lasttask].Time = time.Now()
 			c.nTask--
 			//	log.Printf("map task %d in worker %d is finished\n", lasttask, workerId)
 
@@ -192,13 +192,13 @@ func (c *Coordinator) ReduceDone(args *TaskArgs, reply *TaskReply) error {
 	lasttask := args.LastTask
 	// 如果有要提交的任务,则提交
 	if lasttask != -1 {
-		c.reduceFiles[lasttask].Status = "finish"
-		c.reduceFiles[lasttask].Time = time.Now()
-		// 确认提交
 		err := createReduceResFile(lasttask, workerId)
 		if err != nil {
 			log.Printf("create reduce res file error %v", err)
 		} else {
+			// 确认提交
+			c.reduceFiles[lasttask].Status = "finish"
+			c.reduceFiles[lasttask].Time = time.Now()
 			// 任务数减一
 			c.nTask--
 			//	log.Printf("reduce task %d in worker %d is finished, nTask : %d \n", lasttask, workerId, c.nTask)
@@ -304,14 +304,16 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		}
 
 		for {
+
+			c.mu.Lock()
 			// 如果任务完成，则退出
 			if c.Stage == "reduce" {
+				c.mu.Unlock()
 				break
 			}
 			// 缓缓 防止影响处理进程
 			time.Sleep(time.Millisecond * 300)
 			// 返回的是
-			c.mu.Lock()
 			for i, task := range c.mapFiles {
 				if task.Status == "waiting" || task.Status == "finish" {
 					// 写入log文件

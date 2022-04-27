@@ -127,7 +127,7 @@ func Worker(mapf func(string, string) []KeyValue,
 			log.Printf("Coordinator.GetTask error,workerId:%d", workerId)
 		}
 		//if reply.Tasktype != "wait" {
-		log.Printf("taskId:%d,taskType:%s in worker %d", reply.Taskid, reply.Tasktype, workerId)
+		//log.Printf("taskId:%d,taskType:%s in worker %d", reply.Taskid, reply.Tasktype, workerId)
 		//}
 		// 打个补丁 不知道为啥 会漏掉一个task
 		if reply.Taskid == -1 && reply.Tasktype != "wait" {
