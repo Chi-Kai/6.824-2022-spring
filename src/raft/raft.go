@@ -19,7 +19,7 @@ package raft
 
 import (
 	//	"bytes"
-	"log"
+
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -198,6 +198,8 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer DPrintf("{Node %v}'s state is {state %v,term %v,commitIndex %v,lastApplied %v} before processing requestVoteRequest %v and reply requestVoteResponse %v", rf.me, rf.role, rf.currentTerm, rf.commitIndex, rf.lastApplied, args, reply)
+
 	// 如果拉票的任期小于自己的任期或者 已经投票，则直接返回
 	if args.Term < rf.currentTerm || rf.votedFor != -1 {
 		reply.Term = rf.currentTerm
@@ -219,9 +221,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 		reply.Term = args.Term
 		reply.VoteGranted = true
-
-		rf.electionTimer.Reset(randomElectionTimeout())
-		log.Printf("%d 投票给 %d,重置选举时间", rf.me, args.CandidateId)
+		rf.resetElectionTimer()
 		return
 	}
 }
@@ -283,8 +283,8 @@ type AppendEntryReply struct {
 func (rf *Raft) AppendEntry(args *AppendEntryRequest, reply *AppendEntryReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-
-	// 如果领导人任期小于接受者任期 返回flase
+	defer DPrintf("{Node %v}'s state is {state %v,term %v,commitIndex %v,lastApplied %v} before processing AppendEntriesRequest %v and reply AppendEntriesResponse %v", rf.me, rf.role, rf.currentTerm, rf.commitIndex, rf.lastApplied, args, reply)
+	// 如果领导人任期小于接受者任期 返回flas
 	if rf.currentTerm > args.Term {
 		reply.Term = rf.currentTerm
 		reply.Success = false
@@ -292,17 +292,16 @@ func (rf *Raft) AppendEntry(args *AppendEntryRequest, reply *AppendEntryReply) {
 	}
 
 	// 如果任期大于等于接受者
-
 	// 如果收到心跳 转变为Follower
-	if args.Entries == nil {
-		log.Printf("%d 收到心跳", rf.me)
-		rf.changeRoleWithLock(Follower)
-		reply.Term = rf.currentTerm
-		reply.Success = true
-	}
+
+	rf.changeRoleWithLock(Follower)
+	rf.currentTerm = args.Term
+	rf.votedFor = -1
+	reply.Term = rf.currentTerm
+	reply.Success = true
 
 	//重置选举时间
-	rf.electionTimer.Reset(randomElectionTimeout())
+	rf.resetElectionTimer()
 	return
 }
 
@@ -314,21 +313,25 @@ func (rf *Raft) sendAppendEntry(server int, args *AppendEntryRequest, reply *App
 
 // 角色切换 以及一些绑定的操作
 // 变为Candidate 时，要增加任期，投票给自己，重置选举时间
-// 变为Leader 时，要马上广播心跳
+// 变为Leader 时，要马上广播心跳,同时关闭选举计时
 func (rf *Raft) changeRoleWithLock(role int) {
 	switch role {
 	case Follower:
 		rf.role = Follower
-		log.Printf("%d 转换为Follower", rf.me)
+		rf.heartsbeatTimer.Stop()
+		rf.resetElectionTimer()
+		DPrintf("%d 转换为Follower", rf.me)
 	case Candidate:
 		rf.role = Candidate
 		rf.currentTerm++
 		rf.votedFor = rf.me
-		rf.electionTimer.Reset(randomElectionTimeout())
+		rf.resetElectionTimer()
 	case Leader:
 		rf.role = Leader
-		log.Printf("%d 转换为Leader", rf.me)
+		DPrintf("%d 转换为Leader", rf.me)
 		rf.BroadcastHeartbeat()
+		rf.electionTimer.Stop()
+		rf.resetHeartbeatTimer()
 	}
 }
 
@@ -386,8 +389,8 @@ func (rf *Raft) ticker() {
 	for rf.killed() == false {
 		select {
 		case <-rf.electionTimer.C:
-			log.Printf("%d 选举时间到", rf.me)
 			rf.mu.Lock()
+			DPrintf("%d 选举时间到", rf.me)
 			rf.changeRoleWithLock(Candidate)
 			rf.mu.Unlock()
 			rf.startElection()
@@ -409,10 +412,27 @@ func randomElectionTimeout() time.Duration {
 	return time.Duration(rand.Intn(ElectionTimeout)+ElectionTimeout) * time.Millisecond
 }
 
+// 重置选举时间
+func (rf *Raft) resetElectionTimer() {
+	if !rf.electionTimer.Stop() && len(rf.electionTimer.C) > 0 {
+		DPrintf("%d 选举计时器停止失败", rf.me)
+		<-rf.electionTimer.C
+	}
+	rf.electionTimer.Reset(randomElectionTimeout())
+}
+
+// 重置心跳时间
+func (rf *Raft) resetHeartbeatTimer() {
+	if !rf.heartsbeatTimer.Stop() && len(rf.heartsbeatTimer.C) > 0 {
+		<-rf.heartsbeatTimer.C
+	}
+	rf.heartsbeatTimer.Reset(HeartbeatTimeout)
+}
+
 // 开始选举
 func (rf *Raft) startElection() {
 	// 发送选举请求
-	log.Printf("%d 开始选举", rf.me)
+	DPrintf("%d 开始选举", rf.me)
 	countmu := sync.Mutex{}
 	voteCount := 1
 
@@ -459,7 +479,7 @@ func (rf *Raft) startElection() {
 
 // 发送心跳
 func (rf *Raft) BroadcastHeartbeat() {
-	log.Printf("%d 节点开始广播心跳", rf.me)
+	DPrintf("%d 节点开始广播心跳", rf.me)
 	for i := range rf.peers {
 		if i != rf.me {
 			go func(server int) {
@@ -523,8 +543,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		heartsbeatTimer: time.NewTimer(HeartbeatTimeout),
 		electionTimer:   time.NewTimer(randomElectionTimeout()),
 	}
-	rf.nextIndex = make([]int, rf.lenLog)
-	rf.matchIndex = make([]int, rf.lenLog)
 
 	// Your initialization code here (2A, 2B, 2C).
 
@@ -534,7 +552,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// start ticker goroutine to start elections
 	go rf.ticker()
 
-	log.Printf("创建节点 %d", rf.me)
+	DPrintf("创建节点 %d", rf.me)
 
 	return rf
 }
