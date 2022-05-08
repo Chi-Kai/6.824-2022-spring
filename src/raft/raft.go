@@ -432,13 +432,13 @@ func (rf *Raft) ticker() {
 		t := rf.timeout
 		state := rf.state
 		rf.mu.Unlock()
-
+		a := time.After(t)
 		select {
 		// 超时，开始执行tickerHandler
 		// 此时, Leader 发送心跳给其他节点
 		// Follower 变成 Candidate 开始选举
 		// Candidate 开始新的选举
-		case <-time.After(t):
+		case <-a:
 			if state == Leader {
 				log.Printf("%d 发送心跳", rf.me)
 			} else if state == Follower {
@@ -458,6 +458,7 @@ func (rf *Raft) ticker() {
 // 既可以用来重置选举时间，也可以用来重置心跳时间,根据参数不同
 func (rf *Raft) resetTimer() {
 	rf.mu.Lock()
+
 	rf.timeout = time.Duration(rand.Intn(rf.timenum)+rf.timenum) * time.Millisecond
 	rf.mu.Unlock()
 	if rf.state == Candidate {
