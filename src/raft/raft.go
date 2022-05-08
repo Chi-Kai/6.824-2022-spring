@@ -201,7 +201,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	defer DPrintf("{Node %v}'s state is {state %v,term %v,commitIndex %v,lastApplied %v} before processing requestVoteRequest %v and reply requestVoteResponse %v", rf.me, rf.role, rf.currentTerm, rf.commitIndex, rf.lastApplied, args, reply)
 
 	// 如果拉票的任期小于自己的任期或者 已经投票，则直接返回
-	if args.Term < rf.currentTerm || rf.votedFor != -1 {
+	if args.Term < rf.currentTerm || (args.Term == rf.currentTerm && rf.votedFor != -1 && rf.votedFor != args.CandidateId) {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
 		return
@@ -221,7 +221,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 		reply.Term = args.Term
 		reply.VoteGranted = true
-		rf.resetElectionTimer()
+		rf.electionTimer.Reset(randomElectionTimeout())
 		return
 	}
 }
@@ -294,14 +294,14 @@ func (rf *Raft) AppendEntry(args *AppendEntryRequest, reply *AppendEntryReply) {
 	// 如果任期大于等于接受者
 	// 如果收到心跳 转变为Follower
 
+	rf.electionTimer.Reset(randomElectionTimeout())
 	rf.changeRoleWithLock(Follower)
 	rf.currentTerm = args.Term
-	rf.votedFor = -1
 	reply.Term = rf.currentTerm
 	reply.Success = true
 
 	//重置选举时间
-	rf.resetElectionTimer()
+	rf.electionTimer.Reset(randomElectionTimeout())
 	return
 }
 
@@ -319,13 +319,12 @@ func (rf *Raft) changeRoleWithLock(role int) {
 	case Follower:
 		rf.role = Follower
 		rf.heartsbeatTimer.Stop()
-		rf.resetElectionTimer()
-		DPrintf("%d 转换为Follower", rf.me)
+		rf.electionTimer.Reset(randomElectionTimeout())
 	case Candidate:
 		rf.role = Candidate
 		rf.currentTerm++
 		rf.votedFor = rf.me
-		rf.resetElectionTimer()
+		rf.electionTimer.Reset(randomElectionTimeout())
 	case Leader:
 		rf.role = Leader
 		DPrintf("%d 转换为Leader", rf.me)
@@ -415,10 +414,12 @@ func randomElectionTimeout() time.Duration {
 // 重置选举时间
 func (rf *Raft) resetElectionTimer() {
 	if !rf.electionTimer.Stop() && len(rf.electionTimer.C) > 0 {
-		DPrintf("%d 选举计时器停止失败", rf.me)
 		<-rf.electionTimer.C
 	}
-	rf.electionTimer.Reset(randomElectionTimeout())
+	ok := rf.electionTimer.Reset(randomElectionTimeout())
+	if ok {
+		DPrintf("%d reset election", rf.me)
+	}
 }
 
 // 重置心跳时间
@@ -479,7 +480,6 @@ func (rf *Raft) startElection() {
 
 // 发送心跳
 func (rf *Raft) BroadcastHeartbeat() {
-	DPrintf("%d 节点开始广播心跳", rf.me)
 	for i := range rf.peers {
 		if i != rf.me {
 			go func(server int) {
